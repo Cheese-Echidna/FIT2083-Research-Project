@@ -1,294 +1,325 @@
+import pathlib
+from dataclasses import dataclass, field
+from typing import List, Dict, Tuple
+
 import pandas as pd
 import numpy as np
 import simpy
 import matplotlib.pyplot as plt
-from scipy.stats import gaussian_kde # Ensure this import is present at the top of your file
+from scipy.stats import gaussian_kde
+
+# NOTE: Subtracted 6% baseline from all scores
+
+def time_to_seconds(t: pd.Series) -> pd.Series:
+    """Convert datetime-like or string series to seconds since midnight."""
+    times = pd.to_datetime(t.astype(str), errors='coerce')
+    return times.dt.hour * 3600 + times.dt.minute * 60 + times.dt.second
 
 
+@dataclass
 class Station:
-    def __init__(self, env):
-        self.env = env
-        self.queue = []  # store arrival times
-        self.waiting_times = []  # store computed waiting times
+    env: simpy.Environment
+    queue: List[float] = field(default_factory=list)
+    waiting_times: List[float] = field(default_factory=list)
 
-    def arrive(self, _: float):
-        """A passenger arrives at current env time and joins the queue."""
+    def arrive(self, arrival_time: float) -> None:
+        """Record a passenger arrival at the current simulation time."""
         self.queue.append(self.env.now)
 
-    def board_train(self, departure_time: float):
-        """Board all waiting passengers at a train departure and record their waiting times."""
-        boarded = []
-        for arrival_time in self.queue:
-            if arrival_time <= departure_time:
-                self.waiting_times.append(departure_time - arrival_time)
-                boarded.append(arrival_time)
-        # remove boarded passengers from queue
-        self.queue = [t for t in self.queue if t not in boarded]
+    def board(self, departure_time: float) -> None:
+        """Board all passengers whose arrival <= departure and record wait times."""
+        onboard, remaining = [], []
+        for t in self.queue:
+            if t <= departure_time:
+                self.waiting_times.append(departure_time - t)
+                onboard.append(t)
+            else:
+                remaining.append(t)
+        self.queue = remaining
 
 
-def load_excel_data(path: str):
-    """
-    Load busyness and inbound timetables from an Excel file.
-    Sheet1 (index 0): 'Time' (datetime.time or string like '03:45:00 PM'), 'Sunday', 'Monday-Thursday Average'
-    Sheet2 (index 1): 'Sunday Inbound', 'Monday-Thursday Inbound'
+def load_excel_data(
+        path: pathlib.Path,
+        busyness_sheet: int = 0,
+        timetable_sheet: int = 1
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, List[float]]]:
+    df_bus = pd.read_excel(path, sheet_name=busyness_sheet)
+    df_tt = pd.read_excel(path, sheet_name=timetable_sheet)
 
-    Returns:
-      demand: dict of DataFrames with columns ['hour', 'busyness'] per scenario key
-      timetables: dict of lists of departure times (seconds since midnight) per scenario key
-    """
-    df_busyness = pd.read_excel(path, sheet_name=0)
-    df_tt = pd.read_excel(path, sheet_name=1)
-
-    # Parse and normalize Time column for busyness
-    times_raw = df_busyness['Time']
-    times_dt = pd.to_datetime(times_raw.astype(str), format='%H:%M:%S', errors='coerce')
-    times_sec = times_dt.dt.hour * 3600 + times_dt.dt.minute * 60 + times_dt.dt.second
-
-    demand = {}
-    mapping = [('Sunday', 'Sunday'), ('Monday-Thursday Average', 'MonThu')]
-    for col, key in mapping:
-        df = pd.DataFrame({
+    times_sec = time_to_seconds(df_bus['Time'])
+    demand = {
+        key: pd.DataFrame({
             'hour': (times_sec // 3600).astype(int),
-            'busyness': df_busyness[col].astype(float)
+            'busyness': df_bus[col].astype(float)
         })
-        demand[key] = df
+        for col, key in [('Sunday', 'Sunday'), ('Monday-Thursday Average', 'MonThu')]
+    }
 
     timetables = {}
-    mapping_tt = [('Sunday Inbound', 'Sunday'), ('Monday-Thursday Inbound', 'MonThu')]
-    for col, key in mapping_tt:
-        times_raw_tt = df_tt[col].dropna()
-        secs = []
-        for t in times_raw_tt:
-            dt = pd.to_datetime(str(t), errors='coerce')
-            if pd.isna(dt):
-                dt = pd.to_datetime(str(t), format='%I:%M:%S %p', errors='coerce')
-            secs.append(dt.hour * 3600 + dt.minute * 60 + dt.second)
-        timetables[key] = sorted(secs)
+    for col, key in [('Sunday Inbound', 'Sunday'), ('Monday-Thursday Inbound', 'MonThu')]:
+        secs = (
+            df_tt[col]
+            .dropna()
+            .apply(lambda x: time_to_seconds(pd.Series([x]))[0])
+        )
+        timetables[key] = sorted(secs.tolist())
 
     return demand, timetables
 
 
-def generate_even_timetable(original_timetable: list[float], start_sec: float = 0, end_sec: float = 24*3600) -> list[float]:
-    """
-    Redistribute the same number of trains evenly between start_sec and end_sec.
-    """
-    count = len(original_timetable)
-    if count == 0:
+def redistribute_even(count: int, start: float, end: float) -> List[float]:
+    if count <= 0:
         return []
-    interval = (end_sec - start_sec) / count
-    return [start_sec + i * interval for i in range(count)]
+    interval = (end - start) / count
+    return [start + i * interval for i in range(count)]
 
 
-def generate_weighted_timetable(demand_df: pd.DataFrame, original_timetable: list[float],
-                                start_hour: int = 0, end_hour: int = 24) -> list[float]:
-    """
-    Redistribute trains by sampling departure times based on demand busyness weights.
-    Only times between start_hour and end_hour (inclusive start, exclusive end) are considered.
-    """
-    df_period = demand_df[(demand_df['hour'] >= start_hour) & (demand_df['hour'] < end_hour)].copy()
-    if df_period.empty:
+def generate_even_timetable(
+        original: List[float],
+        start: float = 0,
+        end: float = 24 * 3600
+) -> List[float]:
+    return redistribute_even(len(original), start, end)
+
+
+def generate_weighted_timetable(
+        demand: pd.DataFrame,
+        count: int,
+        start_hour: int = 0,
+        end_hour: int = 24
+) -> List[float]:
+    # 1) select only the hours we care about
+    period = demand[
+        (demand['hour'] >= start_hour) &
+        (demand['hour'] < end_hour)
+        ].copy()
+    if period.empty or count <= 0:
         return []
-    weights = df_period['busyness'].values
-    weights = weights / weights.sum()
-    count = len(original_timetable)
-    hours = np.random.choice(df_period['hour'], size=count, p=weights)
-    secs = []
-    for h in hours:
-        secs.append(h * 3600 + np.random.uniform(0, 3600))
-    return sorted(secs)
 
-def generate_minmax_timetable(original_timetable: list[float]) -> list[float]:
-    """
-    Redistribute trains evenly between the first and last existing departures,
-    minimizing the maximum headway and thus the maximum possible wait.
-    """
-    if not original_timetable:
+    # 2) compute “raw” (float) allocations
+    total_busyness = period['busyness'].sum()
+    period['raw'] = period['busyness'] / total_busyness * count
+
+    # 3) floor to get initial integer allocs
+    period['alloc'] = np.floor(period['raw']).astype(int)
+
+    # 4) enforce at least 1 train if busyness>0
+    mask = (period['busyness'] > 0) & (period['alloc'] < 1)
+    period.loc[mask, 'alloc'] = 1
+
+    # 5) adjust so sum(alloc) == count
+    allocated = period['alloc'].sum()
+
+    if allocated > count:
+        # too many: remove from the lowest-busyness hours first
+        to_remove = int(allocated - count)
+        drop_order = period[period['alloc'] > 1] \
+            .sort_values('busyness') \
+            .head(to_remove) \
+            .index
+        period.loc[drop_order, 'alloc'] -= 1
+
+    elif allocated < count:
+        # too few: distribute remainder by highest fractional‐part, then busyness
+        to_add = int(count - allocated)
+        period['frac'] = period['raw'] - period['alloc']
+        add_order = period.sort_values(
+            ['frac', 'busyness'],
+            ascending=[False, False]
+        ).head(to_add).index
+        period.loc[add_order, 'alloc'] += 1
+
+    # 6) now build the departure‐times list by hour
+    times: List[float] = []
+    for _, row in period.iterrows():
+        h = int(row['hour'])
+        k = int(row['alloc'])
+        if k == 0:
+            continue
+
+        hour_start = h * 3600
+        hour_end   = (h + 1) * 3600
+
+        if k == 1:
+            # singleton in the middle of the hour
+            times.append(hour_start + 0.5 * (hour_end - hour_start))
+        else:
+            # even spacing from start→end inclusive
+            interval = (hour_end - hour_start) / (k - 1)
+            times.extend(hour_start + i * interval for i in range(k))
+
+    return sorted(times)
+
+
+
+
+def generate_minmax_timetable(original: List[float]) -> List[float]:
+    if not original:
         return []
-    start = original_timetable[0]
-    end = original_timetable[-1]
-    return generate_even_timetable(original_timetable, start, end)
+    return redistribute_even(len(original), original[0], original[-1])
 
-def passenger_generator(env: simpy.Environment, station: Station,
-                        demand_df: pd.DataFrame, total_passengers: int):
+
+def passenger_generator(env, station, demand, total):
+    weights = demand['busyness'] / demand['busyness'].sum()
+    # initialize counters
+    generated_per_hour = {hour: 0 for hour in demand['hour']}
+    for hour, weight in zip(demand['hour'], weights):
+        n = int(np.floor(weight * total))
+        generated_per_hour[hour] += n
+        # we will distribute the remainder below
+        times = np.sort(np.random.rand(n) * 3600 + hour * 3600)
+        for t in times:
+            yield env.timeout(max(0, t - env.now))
+            station.arrive(t)
+    # distribute leftover passengers (so sum == total)
+    remainder = total - sum(generated_per_hour.values())
+    # pick top‐weight hours to allocate the leftover one by one
+    top_hours = demand.sort_values('busyness', ascending=False)['hour'].tolist()
+    for i in range(remainder):
+        h = top_hours[i % len(top_hours)]
+        generated_per_hour[h] += 1
+        t = h * 3600 + np.random.rand() * 3600
+        yield env.timeout(max(0, t - env.now))
+        station.arrive(t)
+
+    # sanity check
+    assert sum(generated_per_hour.values()) == total, \
+        f"Generated {sum(generated_per_hour.values())} ≠ expected {total}"
+
+
+
+def train_process(env: simpy.Environment, station: Station, times: List[float]) -> None:
+    """Dispatch trains at scheduled times, with safe timeouts."""
+    for t in times:
+        delay = t - env.now
+        yield env.timeout(max(delay, 0))
+        station.board(t)
+
+
+def run_simulation(
+        excel_path: str,
+        total_passengers_factor: float = 10_000.0
+) -> Tuple[Dict[str, pd.DataFrame], Dict[str, List[float]], Dict[str, List[float]]]:
     """
-    Generate passenger arrivals based on demand weights.
+    Run simulation for real and generated timetables.
+    Returns demand dict, all timetables, and waiting times per scenario.
     """
-    weights = demand_df['busyness'] / demand_df['busyness'].sum()
-    for idx, row in demand_df.iterrows():
-        hour = row['hour']
-        n_arrivals = int(np.round(weights[idx] * total_passengers))
-        start = hour * 3600
-        end = (hour + 1) * 3600
-        arrival_times = np.random.uniform(start, end, size=n_arrivals)
-        for at in np.sort(arrival_times):
-            yield env.timeout(at - env.now)
-            station.arrive(at)
+    np.random.seed(42)
+    path = pathlib.Path(excel_path)
+    demand, timetables = load_excel_data(path)
 
+    # create variants
+    generated: Dict[str, List[float]] = {}
+    for key, original in timetables.items():
+        generated[f"{key}_even24"] = generate_even_timetable(original)
+        # generated[f"{key}_even6_24"] = generate_even_timetable(original, 6 * 3600)
+        generated[f"{key}_weighted"] = generate_weighted_timetable(
+            demand[key], len(original)
+        )
+        generated[f"{key}_even_over_same_time"] = generate_minmax_timetable(original)
 
-def train_process(env: simpy.Environment, station: Station,
-                  timetable_sec: list[float]):
-    """
-    Simulate train departures according to timetable_sec.
-    """
-    for departure in timetable_sec:
-        yield env.timeout(departure - env.now)
-        station.board_train(departure)
+    all_tt = {**timetables, **generated}
+    results: Dict[str, List[float]] = {}
 
-
-def run_simulation(excel_path: str):
-    """
-    Run simulations for real and generated timetable scenarios.
-    Returns:
-      demand: dict of demand DataFrames
-      results: dict of waiting time lists by scenario key
-    """
-    demand, timetables = load_excel_data(excel_path)
-
-    # Generate algorithmic timetables (same train count, redistributed)
-    generated = {}
-    for scenario, original in timetables.items():
-        generated[f"{scenario}_even24"] = generate_even_timetable(original, 0, 24*3600)
-        generated[f"{scenario}_even6_24"] = generate_even_timetable(original, 6*3600, 24*3600)
-        generated[f"{scenario}_weighted"] = generate_weighted_timetable(demand[scenario], original, 0, 24)
-        generated[f"{scenario}_minmax"] = generate_minmax_timetable(original)
-
-    # Combine real and generated timetables
-    all_timetables = {**timetables, **generated}
-
-    results = {}
-    for scenario, timetable in all_timetables.items():
-        # Determine base demand key (strip suffix if generated)
-        base_key = scenario.split('_')[0]
-        total_percentage = demand[base_key]['busyness'].sum()
-        total_passengers = int(1000 * total_percentage)
+    for scenario, times in all_tt.items():
+        base = scenario.split('_')[0]
+        total = int(total_passengers_factor * demand[base]['busyness'].sum())
 
         env = simpy.Environment()
         station = Station(env)
-        env.process(passenger_generator(env, station,
-                                        demand[base_key], total_passengers))
-        env.process(train_process(env, station, timetable))
+        env.process(passenger_generator(env, station, demand[base], total))
+        env.process(train_process(env, station, times))
         env.run(until=24 * 3600)
+
+        # assume leftover passengers board on first train next morning
+        if station.queue and times:
+            next_dep = times[0] + 24 * 3600
+            for arrival in station.queue:
+                station.waiting_times.append(next_dep - arrival)
+            station.queue.clear()
 
         results[scenario] = station.waiting_times
 
-    return demand, results
+    return demand, all_tt, results
 
 
-def plot_demand(demand: dict[str, pd.DataFrame]):
+def plot_demand(demand: Dict[str, pd.DataFrame]) -> None:
     """Plot hourly busyness for each scenario."""
     plt.figure()
     for key, df in demand.items():
-        hours = df['hour']
-        busyness = df['busyness']
-        plt.plot(hours, busyness, marker='o', label=key)
+        plt.plot(df['hour'], df['busyness'], marker='o', label=key)
     plt.xlabel('Hour of Day')
-    plt.ylabel('Busyness (relative)')
-    plt.title('Hourly Busyness by Scenario')
+    plt.ylabel('Busyness')
+    plt.title('Hourly Busyness')
     plt.legend()
     plt.grid(True)
     plt.show()
 
 
-def plot_waiting_times(results: dict[str, list[float]]):
-    """Plot waiting time distribution curves using KDE, comparing each baseline scenario
-    to its variants, with average and max wait times in the legend."""
-    max_minutes = 60
-    # Create a smooth range of x values for plotting KDE
-    x_grid = np.linspace(0, max_minutes, 500)
+def plot_waiting_times(
+        timetables: Dict[str, List[float]],
+        results: Dict[str, List[float]]
+) -> None:
+    """Plot KDE of waiting times and train schedules with hourly & 6-hour grid."""
+    MAX_MIN = 60
+    x = np.linspace(0, MAX_MIN, 500)
 
-    potential_base_keys = sorted(list(set([key.split('_')[0] for key in results.keys()])))
-    actual_base_keys = [bk for bk in potential_base_keys if bk in results]
+    grouped: Dict[str, List[Tuple[str, np.ndarray]]] = {}
+    for key, waits in results.items():
+        base = key.split('_')[0]
+        grouped.setdefault(base, []).append((key, np.array(waits) / 60.0))
 
-    for base_key in actual_base_keys:
-        plt.figure(figsize=(12, 7))
+    for base, series in grouped.items():
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+        colors = plt.cm.tab10(np.linspace(0, 1, len(series)))
 
-        # 1. Plot the baseline scenario itself
-        if base_key in results:
-            base_waits_raw = results[base_key]
-            base_waits_min = np.array(base_waits_raw) / 60.0
+        # ---- plot the KDEs as before ----
+        for (name, data), color in zip(series, colors):
+            if len(data) >= 2:
+                kde = gaussian_kde(data)
+                label = (
+                    f"{name} (avg={data.mean():.1f}, "
+                    f"p90={np.percentile(data, 90):.0f}, "
+                    f"p95={np.percentile(data, 95):.0f}, "
+                    f"p99={np.percentile(data, 99):.0f})"
+                )
+                ax1.plot(x, kde(x), label=label, color=color)
+        ax1.set_xlabel('Waiting Time (min)')
+        ax1.set_ylabel('Density')
+        ax1.set_title(f'KDE of Waiting Time Distributions: {base}')
+        ax1.set_xlim(0, MAX_MIN)
+        ax1.grid(True)
+        ax1.legend(fontsize='small')
 
-            base_avg_wait_str = "N/A"
-            base_max_wait_str = "N/A"
+        # Timeline plot
+        for idx, (name, data) in enumerate(series):
+            train_times = [t / 3600 for t in sorted(timetables[name])]
+            y_pos = idx + 1
+            ax2.scatter(train_times, [y_pos] * len(train_times),
+                        color=colors[idx], label=name)
 
-            if len(base_waits_min) > 1:  # KDE needs more than 1 point
-                base_avg_wait = np.mean(base_waits_min)
-                base_max_wait = np.max(base_waits_min)
-                base_avg_wait_str = f"{base_avg_wait:.2f}"
-                base_max_wait_str = f"{base_max_wait:.2f}"
+        # hourly & 6-hour grid lines
+        ax2.set_xlim(0, 24)
+        ax2.set_ylim(0.5, len(series) + 0.5)
+        # minor ticks every 1 hour, major every 6 hours
+        ax2.set_xticks(np.arange(0, 25, 1), minor=True)
+        ax2.set_xticks(np.arange(0, 25, 6), minor=False)
+        # draw grids
+        ax2.grid(which='minor', color='lightgrey', linestyle='-', linewidth=0.5)
+        ax2.grid(which='major', color='grey', linestyle='-', linewidth=1.0)
 
-                try:
-                    kde = gaussian_kde(base_waits_min)
-                    plt.plot(x_grid, kde(x_grid), linewidth=2.5,
-                             label=f"{base_key} (Baseline, Avg: {base_avg_wait_str} min, Max: {base_max_wait_str} min)")
-                except Exception as e:  # Catch potential errors with KDE on unusual data
-                    print(f"Could not plot KDE for {base_key}: {e}")
-                    # Fallback to an empty plot with label if KDE fails
-                    plt.plot([], [], linewidth=2.5,
-                             label=f"{base_key} (Baseline, Avg: {base_avg_wait_str} min, Max: {base_max_wait_str} min, KDE Error)")
+        ax2.set_yticks(range(1, len(series) + 1))
+        ax2.set_yticklabels([name for name, _ in series])
+        ax2.set_xlabel('Time (hour)')
+        ax2.set_ylabel('Timetable Variant')
+        ax2.set_title(f'Train Schedule Timeline: {base}')
 
-            elif len(base_waits_min) == 1:  # Handle single point case (KDE not meaningful)
-                base_avg_wait_str = f"{base_waits_min[0]:.2f}"
-                base_max_wait_str = f"{base_waits_min[0]:.2f}"
-                plt.plot([], [],
-                         label=f"{base_key} (Baseline, Avg: {base_avg_wait_str} min, Max: {base_max_wait_str} min, Single Point)")
-            else:  # No data
-                plt.plot([], [], label=f"{base_key} (Baseline, Avg: N/A, Max: N/A, No Data)")
-
-        # 2. Plot all variant scenarios related to this base_key
-        variant_scenarios_data = []
-        for scenario_key, scenario_waits_raw in results.items():
-            if scenario_key.startswith(base_key + "_"):
-                variant_scenarios_data.append((scenario_key, scenario_waits_raw))
-
-        sorted_variants = sorted(variant_scenarios_data, key=lambda item: item[0])
-
-        for variant_key, waits_raw in sorted_variants:
-            waits_min = np.array(waits_raw) / 60.0
-
-            avg_wait_str = "N/A"
-            max_wait_str = "N/A"
-
-            if len(waits_min) > 1:  # KDE needs more than 1 point
-                avg_wait = np.mean(waits_min)
-                max_wait = np.max(waits_min)
-                avg_wait_str = f"{avg_wait:.2f}"
-                max_wait_str = f"{max_wait:.2f}"
-
-                try:
-                    kde = gaussian_kde(waits_min)
-                    plt.plot(x_grid, kde(x_grid), linewidth=1.5, alpha=0.7,
-                             label=f"{variant_key} (Avg: {avg_wait_str} min, Max: {max_wait_str} min)")
-                except Exception as e:
-                    print(f"Could not plot KDE for {variant_key}: {e}")
-                    plt.plot([], [], linewidth=1.5, alpha=0.7,
-                             label=f"{variant_key} (Avg: {avg_wait_str} min, Max: {max_wait_str} min, KDE Error)")
-
-            elif len(waits_min) == 1:  # Handle single point case
-                avg_wait_str = f"{waits_min[0]:.2f}"
-                max_wait_str = f"{waits_min[0]:.2f}"
-                plt.plot([], [],
-                         label=f"{variant_key} (Avg: {avg_wait_str} min, Max: {max_wait_str} min, Single Point)")
-            else:  # No data
-                plt.plot([], [], label=f"{variant_key} (Avg: N/A, Max: N/A, No Data)")
-
-        plt.xlabel('Waiting Time (minutes)')
-        plt.ylabel('Density')
-        title_text = f'Smoothed Waiting Time Distribution: {base_key} and Variants'
-        if not sorted_variants and base_key in results:
-            title_text = f'Smoothed Waiting Time Distribution: {base_key}'
-
-        plt.title(title_text)
-        plt.legend(fontsize='small')
-        plt.grid(True)
-        plt.xlim(0, max_minutes)
-        plt.ylim(bottom=0)  # Ensure density is not negative
+        plt.tight_layout()
         plt.show()
 
 
-if __name__ == "__main__":
-    excel_file = './data/input V1.xlsx'
-    demand, _ = load_excel_data(excel_file)
-    plot_demand(demand)
-
-    _, results = run_simulation(excel_file)
-    plot_waiting_times(results)
+if __name__ == '__main__':
+    FILE = './data/input V1.xlsx'
+    demand_data, all_tt, sim_results = run_simulation(FILE)
+    plot_demand(demand_data)
+    plot_waiting_times(all_tt, sim_results)
