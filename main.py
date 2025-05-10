@@ -255,6 +255,9 @@ def plot_demand(demand: Dict[str, pd.DataFrame]) -> None:
     plt.grid(True)
     plt.show()
 
+def new_name(name: str) -> str:
+    return name if '_' in name else f"{name}_current"
+
 
 def plot_waiting_times(
         timetables: Dict[str, List[float]],
@@ -278,10 +281,10 @@ def plot_waiting_times(
             if len(data) >= 2:
                 kde = gaussian_kde(data)
                 label = (
-                    f"{name} (avg={data.mean():.1f}, "
-                    f"p90={np.percentile(data, 90):.0f}, "
-                    f"p95={np.percentile(data, 95):.0f}, "
-                    f"p99={np.percentile(data, 99):.0f})"
+                    f"{new_name(name)} (avg={data.mean():.1f}, "
+                    f"p90={np.percentile(data, 90):.1f}, "
+                    f"p95={np.percentile(data, 95):.1f}, "
+                    f"p99={np.percentile(data, 99):.1f})"
                 )
                 ax1.plot(x, kde(x), label=label, color=color)
         ax1.set_xlabel('Waiting Time (min)')
@@ -309,7 +312,7 @@ def plot_waiting_times(
         ax2.grid(which='major', color='grey', linestyle='-', linewidth=1.0)
 
         ax2.set_yticks(range(1, len(series) + 1))
-        ax2.set_yticklabels([name for name, _ in series])
+        ax2.set_yticklabels([new_name(name) for name, _ in series])
         ax2.set_xlabel('Time (hour)')
         ax2.set_ylabel('Timetable Variant')
         ax2.set_title(f'Train Schedule Timeline: {base}')
